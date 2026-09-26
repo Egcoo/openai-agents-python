@@ -1,19 +1,7 @@
-import os
-from openai import AsyncOpenAI
-from dotenv import load_dotenv
-from agents import Agent, Runner, OpenAIChatCompletionsModel
+from agents import Agent, Runner
 from agents.decorators import tool
 
-load_dotenv()
-client = AsyncOpenAI(
-    api_key=os.environ["DEEPSEEK_API_KEY"],
-    base_url=os.environ["DEEPSEEK_BASE_URL"],
-)
-
-model = OpenAIChatCompletionsModel(
-    model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
-    openai_client=client,
-)
+from deepseek_config import model
 
 # 1. 模拟数据库
 # 注意：虚拟数据，不是真实行情
