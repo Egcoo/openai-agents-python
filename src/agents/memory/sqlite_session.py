@@ -58,6 +58,7 @@ class SQLiteSession(SessionABC):
         self.messages_table = messages_table
         self._local = threading.local()
         self._connections: set[sqlite3.Connection] = set()
+        self._connection_owners: dict[sqlite3.Connection, threading.Thread] = {}
         self._quarantined_connections: set[sqlite3.Connection] = set()
         self._connections_lock = threading.Lock()
         self._closed = False
@@ -152,6 +153,7 @@ class SQLiteSession(SessionABC):
 
         with self._connections_lock:
             self._connections.discard(conn)
+            self._connection_owners.pop(conn, None)
             if close_failed:
                 self._quarantined_connections.add(conn)
             else:
@@ -171,6 +173,10 @@ class SQLiteSession(SessionABC):
         else:
             # Use thread-local connections for file databases
             if not hasattr(self._local, "connection"):
+                # Release retired workers' connections before opening the replacement, so a
+                # burst of exits cannot exhaust the descriptors this allocation needs.
+                with self._connections_lock:
+                    self._close_connections_from_exited_threads()
                 connection = sqlite3.connect(
                     str(self.db_path),
                     check_same_thread=False,
@@ -179,10 +185,26 @@ class SQLiteSession(SessionABC):
                 self._local.connection = connection
                 with self._connections_lock:
                     self._connections.add(connection)
+                    self._connection_owners[connection] = threading.current_thread()
             assert isinstance(self._local.connection, sqlite3.Connection), (
                 f"Expected sqlite3.Connection, got {type(self._local.connection)}"
             )
             return self._local.connection
+
+    def _close_connections_from_exited_threads(self) -> None:
+        """Close tracked connections whose owning worker thread has exited."""
+        # Callers hold _connections_lock. A worker's thread-local connection is
+        # unreachable once its thread is gone, so this registry is the only reference.
+        for conn, owner in list(self._connection_owners.items()):
+            if owner.is_alive():
+                continue
+            try:
+                conn.close()
+            except Exception:
+                self._quarantined_connections.add(conn)
+            # Evicted after the close, so an interrupt cannot drop an open connection.
+            del self._connection_owners[conn]
+            self._connections.discard(conn)
 
     @staticmethod
     def _configure_connection(conn: sqlite3.Connection) -> None:
@@ -447,35 +469,23 @@ class SQLiteSession(SessionABC):
         Returns:
             The most recent item if it exists, None if the session is empty
         """
+        return await self._pop_item_with_validation()
+
+    async def _pop_item_with_validation(
+        self, validate: Callable[[TResponseInputItem], None] | None = None
+    ) -> TResponseInputItem | None:
+        """Validate the claimed item before committing its removal.
+
+        A validation exception rolls back the deletion, preserving the row's ID
+        and position. The callback runs synchronously in the SQLite worker thread.
+        """
 
         def _pop_item_sync():
             with self._write_connection() as conn:
-                # Use DELETE with RETURNING to atomically delete and return the most recent item
-                cursor = conn.execute(
-                    f"""
-                    DELETE FROM {self.messages_table}
-                    WHERE id = (
-                        SELECT id FROM {self.messages_table}
-                        WHERE session_id = ?
-                        ORDER BY id DESC
-                        LIMIT 1
-                    )
-                    RETURNING message_data
-                    """,
-                    (self.session_id,),
-                )
-
-                result = cursor.fetchone()
-                conn.commit()
-
-                while result:
-                    message_data = result[0]
-                    try:
-                        item = json.loads(message_data)
-                        return item
-                    except (json.JSONDecodeError, TypeError):
-                        # Drop corrupted JSON entries and keep looking for a valid item.
-                        cursor = conn.execute(
+                while True:
+                    # Claim the tail inside the transaction that owns validation.
+                    with closing(
+                        conn.execute(
                             f"""
                             DELETE FROM {self.messages_table}
                             WHERE id = (
@@ -488,10 +498,23 @@ class SQLiteSession(SessionABC):
                             """,
                             (self.session_id,),
                         )
+                    ) as cursor:
                         result = cursor.fetchone()
-                        conn.commit()
 
-                return None
+                    if result is None:
+                        conn.commit()
+                        return None
+
+                    try:
+                        item = json.loads(result[0])
+                    except (json.JSONDecodeError, TypeError):
+                        # Drop corrupted JSON entries and keep looking for a valid item.
+                        conn.commit()
+                        continue
+                    if validate is not None:
+                        validate(item)
+                    conn.commit()
+                    return item
 
         return await _await_mutation(asyncio.to_thread(_pop_item_sync))
 
@@ -541,6 +564,7 @@ class SQLiteSession(SessionABC):
                 del self._local.connection
 
             with self._connections_lock:
+                self._connection_owners.clear()
                 has_unclosed_connections = bool(self._quarantined_connections)
             if not has_unclosed_connections and self._lock_path is not None:
                 with self._connections_lock:
